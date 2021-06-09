@@ -1,0 +1,681 @@
+---
+title: "Neural network"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+**NOTE 1: Change line 30 to your working direction, where you save this Rmd file and data file**
+
+
+
+
+
+
+
+
+
+
+```{r}
+rm(list = ls())
+## Set working direction
+mainDir="C:\\Users\\Thai Thanh\\Desktop\\thesis"
+setwd(mainDir)
+## Create output folder
+nnDir=file.path(mainDir,"neuralnetwork")
+dir.create(nnDir)
+```
+
+
+```{r}
+library("readxl")
+library(xts)
+library(lubridate)
+library(dplyr)
+library(foreach)
+library(doParallel)
+library(tictoc)
+library(caret)
+library(keras) 
+```
+
+
+```{r}
+dat=read_excel("PredictorData_Updated_upto2019.xlsx", sheet = 1, na=c("NaN",""))
+class(dat)
+dim(dat)
+dat$yyyymm=as.Date(parse_date_time(dat$yyyymm,"ym"))
+dat=xts(dat[,-1],order.by = dat$yyyymm)
+frequency(dat)
+nyears(dat)
+nmonths(dat)
+start(dat)
+end(dat)
+```
+
+```{r}
+# Excess Return
+dat$logPremia=log(dat$CRSP_SPvw+1)-log(1+dat$Rfree)
+
+# lag Price
+dat$lag_P=lag.xts(dat$Index,k=1)
+
+# Dividends
+dat$logDY=log(dat$D12/dat$lag_P)
+
+# Earnings
+dat$logEP=log(dat$E12/dat$Index)
+
+# Book value:                   dat$b.m
+# Corporate issuing activity:   dat$ntis
+# 3-month treasury bill:        dat$tbl
+
+# Select 5 important features: "b.m","logDY","logEP","ntis","tbl"
+dat=dat["192612/201812",c("logPremia","b.m","logDY","logEP","ntis","tbl")]
+nrow(dat)
+```
+
+```{r}
+neuralnetwork=function(data,feature,forecast_start=20){
+  # forecast_start is either 20 or year (e.g: 1965)
+  # data is either dat or subset of dat (e.g: dat["192612/200412"])
+  # feature is 1 of 5 predictors: "b.m","logDY","logEP","ntis","tbl"
+  
+############# Data preparation
+  if(!is.xts(data)) print("Data is not xts object") # make sure data is xts object
+  tmp=data[,c("logPremia",feature)];rm(data)
+  names(tmp)=c("y","x")
+  tmp[,-1]=lag.xts(tmp[,-1],k=1) # lag regressor
+  tmp=tmp[complete.cases(tmp),] # remove NA, keep tmp b/c it includes time index to use later
+  tmp_x=as.matrix(tmp[,2]) # predictors data is a matrix, keep name of column
+  tmp_y=as.matrix(tmp[,1]) #  target is a matrix
+
+############ 1. IS Regressions
+  
+  ##### 1.1. Null model: mean
+  IS_avg=mean(tmp[,1])
+  IS_error_Null=(tmp[,1]-IS_avg)^2
+  
+  ##### 1.2. Alternative model
+    ### 1.2.1. Tune hyperparamters 
+      ### Split data
+  myFolds= createTimeSlices(1:nrow(tmp_y), 
+                            initialWindow = nrow(tmp_y)-96, 
+                            horizon = 48, 
+                            skip=23,
+                            fixedWindow = FALSE)
+      ### Function to define model
+  define_model=function(neurons=10){
+    k_clear_session()
+    nn_model =  keras_model_sequential()
+  
+    nn_model %>% layer_dense(units=neurons,
+                             activation = 'relu',
+                             input_shape =1) %>%
+                  layer_dropout(rate=0.8) %>%
+                  layer_dense(units=1)
+  
+    nn_model %>% compile (optimizer = optimizer_rmsprop(lr = 0.002),
+                          loss = 'mse')
+    return(nn_model)
+  }
+     ### Funtion to tune model
+  tune_model=function(x_build,y_build,x_valid,y_valid,neurons=10){
+    nn_model=define_model(neurons=neurons)
+    nn_model %>% fit(x_build, y_build,
+                             validation_data=list(x_valid,y_valid),
+                             epochs=80,
+                             batch_size=128,
+                             shuffle=FALSE,
+                             verbose=1) 
+    cv_loss=nn_model %>% evaluate(x_valid,y_valid,verbose=0)
+    rm(nn_model)
+    k_clear_session()
+    return(cv_loss)
+  }
+      ### Tune model
+  neuronsGrid = c(10,15,20)
+  cv_errors= foreach(j=1:length(neuronsGrid), .combine='cbind') %:%
+    foreach(i=1:3, .combine='c') %do% {
+      a=tune_model(x_build = tmp_x[myFolds$train[[i]],],
+                   y_build=tmp_y[myFolds$train[[i]],],
+                   x_valid=tmp_x[myFolds$test[[i]],],
+                   y_valid=tmp_y[myFolds$test[[i]],],
+                   neurons=neuronsGrid[j])
+      return(a)
+    }
+  cv_mse=apply(cv_errors,2,mean)
+  best_neurons=neuronsGrid[which.min(cv_mse)] 
+    ### 1.2.2. Fit final model
+  k_clear_session()
+  IS_fit=define_model(neurons=best_neurons)
+  IS_fit %>% fit(tmp_x,tmp_y,
+                 epochs = 80,
+                 batch_size=128,
+                 verbose = 1, 
+                 shuffle=FALSE)
+    ### 1.2.3. Predictions and Errors
+      ## Predict
+  IS_preds_vec=IS_fit %>% predict(tmp_x)
+  IS_preds_vec=xts(IS_preds_vec,order.by = time(tmp)) 
+      ## Errors
+  IS_error_Alt=(tmp_y-IS_preds_vec)^2
+  IS_error_Alt=xts(IS_error_Alt,order.by = time(tmp))
+  
+  rm(IS_fit,cv_errors,best_neurons,cv_mse)
+  gc(verbose = FALSE)
+  k_clear_session()
+
+############# 2. OOS Regressions
+
+  OOS_period=NULL     
+
+    ## 4 models:    
+  OOS_avgs_vec=NULL       # 1. Model Null: Historical Average (HA). This satisfies the CT restriction, so use it as HA with CT restriction
+  OOS_preds_vec=NULL      # Predictions, without CT restriction
+  OOS_preds_CT_vec=NULL   # 2. Model Alternative 1: predictions with CT restriction
+  OOS_preds_Alt2_vec=NULL # 3. Model Alternative 2: combination of predictions and HA
+  OOS_preds_Alt3_vec=NULL # 4. Model Alternative 3: combination of predictions with CT restriction and HA (model Alt1 and HA)
+
+
+  OOS_error_Null=NULL 
+  OOS_error_Alt1=NULL  
+  OOS_error_Alt2=NULL 
+  OOS_error_Alt3=NULL 
+
+  if (forecast_start==20|forecast_start-lubridate::year(start(tmp))<19) {start_loop=start(tmp)+months(238)}
+  else {start_loop=as.Date.yearmon(forecast_start)-months(1)}
+  loop_index=seq.Date(from = start_loop,
+                      to=end(tmp)-months(1),
+                      by="month")
+  
+  for(i in loop_index){
+   
+    ########### Data preparation   
+      ### Training data
+    i=as.Date(i)
+    train_data=tmp[paste0("/",i)] 
+    train_x=as.matrix(train_data[,2]) # predictors data is a matrix, keep name
+    train_y=as.matrix(train_data[,1])#  target is a matrix
+      ### Forecast data
+    forecast_data=tmp[i+months(1)] 
+    forecast_x=as.matrix(forecast_data[,2]) # predictors data is a matrix
+    forecast_y=as.matrix(forecast_data[,1]) #  target is a matrix
+      ### OOS data 
+    OOS_period=c(OOS_period,i+months(1))
+    OOS_data=tmp[as.Date(OOS_period)] %>% as.data.frame() 
+    
+    ########## 2.1. Null model: Historical Average (HA) with CT restriction
+    OOS_avg=mean(train_y)
+    OOS_avgs_vec=c(OOS_avgs_vec,OOS_avg) 
+    OOS_error_Null=c(OOS_error_Null,(forecast_y-OOS_avg)^2)
+    
+    ########## 2.2. Model Alternative 1: 
+    ### 2.2.1. Tune hyperparamters 
+    ### Split data
+    myFolds= createTimeSlices(1:nrow(train_y), 
+                          initialWindow = nrow(train_y)-96, 
+                          horizon = 48, 
+                          skip=23,
+                          fixedWindow = FALSE)
+    ### Tune model
+    cv_errors= foreach(j=1:length(neuronsGrid), .combine='cbind') %:%
+  foreach(i=1:3, .combine='c') %do% {
+      a=tune_model(x_build = train_x[myFolds$train[[i]],],
+                 y_build=train_y[myFolds$train[[i]],],
+                 x_valid=train_x[myFolds$test[[i]],],
+                 y_valid =train_y[myFolds$test[[i]],],
+                 neurons=neuronsGrid[j])
+    return(a)
+  }
+    cv_mse=apply(cv_errors,2,mean)
+    best_neurons=neuronsGrid[which.min(cv_mse)] 
+    ### 2.2.2. Fit final model
+    k_clear_session()
+    OOS_fit=define_model(neurons=best_neurons)
+    OOS_fit %>% fit(train_x,train_y,
+                    epochs = 80,
+                    batch_size=128,
+                    verbose = 1, 
+                    shuffle=FALSE)
+    ### 2.2.3. Predictions and Errors
+      ## Predict
+    OOS_pred=OOS_fit %>% predict(forecast_x)
+    OOS_pred_CT=ifelse(OOS_pred<0,0,OOS_pred)
+    OOS_preds_vec=c(OOS_preds_vec,OOS_pred)
+    OOS_preds_CT_vec=c(OOS_preds_CT_vec,OOS_pred_CT)
+    OOS_error_Alt1=c(OOS_error_Alt1,(forecast_y-OOS_pred_CT)^2)
+    rm(OOS_fit,cv_errors,best_neurons,cv_mse)
+    gc(verbose = FALSE)
+    k_clear_session() 
+    ######## 2.3. Model Alternative 2: 
+    OOS_delta=cov(OOS_data[,1]-OOS_avgs_vec,OOS_preds_vec-OOS_avgs_vec)/var(OOS_preds_vec-OOS_avgs_vec)
+    OOS_pred_Alt2=(1-OOS_delta)*OOS_avg+OOS_delta*OOS_pred
+    if (is.na(OOS_pred_Alt2)|OOS_pred_Alt2<0) {
+      OOS_pred_Alt2=0
+    }
+    OOS_preds_Alt2_vec=c(OOS_preds_Alt2_vec,OOS_pred_Alt2)
+    OOS_error_Alt2=c(OOS_error_Alt2,(forecast_y-OOS_pred_Alt2)^2)
+    
+    ########## 2.4. Model Alternative 3: 
+    OOS_delta_CT=cov(OOS_data[,1]-OOS_avgs_vec,OOS_preds_CT_vec-OOS_avgs_vec)/var(OOS_preds_CT_vec-OOS_avgs_vec)
+    OOS_pred_Alt3=(1-OOS_delta_CT)*OOS_avg+OOS_delta_CT*OOS_pred_CT
+    if (is.na(OOS_pred_Alt3)|OOS_pred_Alt3<0) {
+      OOS_pred_Alt3=0
+    }
+    OOS_preds_Alt3_vec=c(OOS_preds_Alt3_vec,OOS_pred_Alt3)
+    OOS_error_Alt3=c(OOS_error_Alt3,(forecast_y-OOS_pred_Alt3)^2)
+  }
+  
+############### Computing statistics
+  
+  ###### 1. Some objects saved for used later
+  
+      ## Feature index 
+  all_features=c("b.m","logDY","logEP","ntis","tbl")
+  feature_ind=which(all_features==feature)
+      ## OOS period
+  OOS_period=as.Date(OOS_period)
+  
+      ### save predictions for model combination later
+  OOS_preds_vec=xts(OOS_preds_vec,order.by = OOS_period)
+  OOS_preds_CT_vec=xts(OOS_preds_CT_vec,order.by = OOS_period)
+  predictions=merge(tmp[,1],IS_preds_vec,OOS_preds_vec,OOS_preds_CT_vec)
+  names(predictions)=c("logPremia","IS_preds","OOS_preds","OOS_preds_CT")
+  predictions$feature=feature_ind
+
+  ######## 2. Compute cumulative SSE for diagnostic plot
+    
+    ##### IS SSE
+  IS_SSE=cumsum(IS_error_Null)-cumsum(IS_error_Alt)
+    
+    ##### OOS SSE
+  OOS_error_Null=xts(OOS_error_Null,order.by = OOS_period)
+  OOS_error_Alt1=xts(OOS_error_Alt1,order.by = OOS_period)
+  OOS_error_Alt2=xts(OOS_error_Alt2,order.by = OOS_period)
+  OOS_error_Alt3=xts(OOS_error_Alt3,order.by = OOS_period)
+  
+  OOS_SSE_Alt1=cumsum(OOS_error_Null)-cumsum(OOS_error_Alt1)
+  OOS_SSE_Alt2=cumsum(OOS_error_Null)-cumsum(OOS_error_Alt2)
+  OOS_SSE_Alt3=cumsum(OOS_error_Null)-cumsum(OOS_error_Alt3)
+    
+    ## Merge IS and OOS SSE
+  SSE=merge(IS_SSE,OOS_SSE_Alt1,OOS_SSE_Alt2,OOS_SSE_Alt3)
+  names(SSE)=c("IS","OOS_Alt1","OOS_Alt2","OOS_Alt3")
+  SSE$feature=feature_ind
+  
+  ########## 3. Compute statistics
+    
+    ### Length of IS period and OOS period
+  t_IS=length(IS_SSE)        # full sample
+  t_OOS=length(OOS_SSE_Alt1) # OOS period
+  OOS_period_ind=paste0(start(OOS_SSE_Alt1),"/")
+    
+    ##### 3.1. Compute IS statistics 
+  
+      ### IS RMSE difference
+  IS_MSE_Null=mean(IS_error_Null)
+  IS_MSE_Alt=mean(IS_error_Alt)
+  IS_delta_RMSE=(sqrt(IS_MSE_Null)-sqrt(IS_MSE_Alt))*100
+  IS_delta_RMSE_forOOS=(sqrt(mean(IS_error_Null[OOS_period_ind]))-sqrt(mean(IS_error_Alt[OOS_period_ind])))*100
+      ### IS R2 
+  IS_R2=(1-sum(IS_error_Alt)/sum(IS_error_Null))*100
+  IS_R2_forOOS=(1-sum(IS_error_Alt[OOS_period_ind])/sum(IS_error_Null[OOS_period_ind]))*100
+      ### IS MSE-F statistic
+  IS_MSEF=t_IS*(IS_MSE_Null-IS_MSE_Alt)/IS_MSE_Alt
+      ### IS MSPE-adjusted statistics and its t-statistics
+  IS_aMSPE=IS_MSE_Null-(IS_MSE_Alt-mean((IS_avg-IS_preds_vec)^2))
+  f_IS=IS_error_Null-(IS_error_Alt-(IS_avg-IS_preds_vec)^2)
+  t_statisitcs_IS=summary(lm(f_IS~1))$coefficients[,3]
+
+    ####### 3.2. Compute OOS statistics
+      ### OOS RMSE difference
+  OOS_MSE_Null=mean(OOS_error_Null)
+  OOS_MSE_Alt1=mean(OOS_error_Alt1)
+  OOS_MSE_Alt2=mean(OOS_error_Alt2)
+  OOS_MSE_Alt3=mean(OOS_error_Alt3)
+  OOS_delta_RMSE_Alt1=(sqrt(OOS_MSE_Null)-sqrt(OOS_MSE_Alt1))*100
+  OOS_delta_RMSE_Alt2=(sqrt(OOS_MSE_Null)-sqrt(OOS_MSE_Alt2))*100
+  OOS_delta_RMSE_Alt3=(sqrt(OOS_MSE_Null)-sqrt(OOS_MSE_Alt3))*100
+      ### OOS R2
+  OOS_R2_Alt1=(1-sum(OOS_error_Alt1)/sum(OOS_error_Null))*100
+  OOS_R2_Alt2=(1-sum(OOS_error_Alt2)/sum(OOS_error_Null))*100
+  OOS_R2_Alt3=(1-sum(OOS_error_Alt3)/sum(OOS_error_Null))*100
+      ### OOS MSE-F statistics
+  OOS_MSEF_Alt1=t_OOS*(OOS_MSE_Null-OOS_MSE_Alt1)/OOS_MSE_Alt1
+  OOS_MSEF_Alt2=t_OOS*(OOS_MSE_Null-OOS_MSE_Alt2)/OOS_MSE_Alt2
+  OOS_MSEF_Alt3=t_OOS*(OOS_MSE_Null-OOS_MSE_Alt3)/OOS_MSE_Alt3
+      ### OOS MSPE-adjusted statistics
+  OOS_aMSPE_Alt1=OOS_MSE_Null-(OOS_MSE_Alt1-mean((OOS_avgs_vec-OOS_preds_CT_vec)^2))
+  OOS_aMSPE_Alt2=OOS_MSE_Null-(OOS_MSE_Alt2-mean((OOS_avgs_vec-OOS_preds_Alt2_vec)^2))
+  OOS_aMSPE_Alt3=OOS_MSE_Null-(OOS_MSE_Alt3-mean((OOS_avgs_vec-OOS_preds_Alt3_vec)^2))
+      ### Compute t-statistics 
+  f_Alt1=OOS_error_Null-(OOS_error_Alt1-(OOS_avgs_vec-OOS_preds_CT_vec)^2)
+  f_Alt2=OOS_error_Null-(OOS_error_Alt2-(OOS_avgs_vec-OOS_preds_Alt2_vec)^2)
+  f_Alt3=OOS_error_Null-(OOS_error_Alt3-(OOS_avgs_vec-OOS_preds_Alt3_vec)^2)
+  t_statisitcs_Alt1=summary(lm(f_Alt1~1))$coefficients[,3]
+  t_statisitcs_Alt2=summary(lm(f_Alt2~1))$coefficients[,3]
+  t_statisitcs_Alt3=summary(lm(f_Alt3~1))$coefficients[,3]  
+  
+
+  return(list(SSE=SSE,
+              predictions=predictions,
+              statistics_table=data.frame(Algorithm="neuralnetwork",
+                                          variable=feature,
+                                          feature_ind=feature_ind,
+                                          IS_delta_RMSE=IS_delta_RMSE,
+                                          IS_delta_RMSE_forOOS=IS_delta_RMSE_forOOS,
+                                          IS_R2=IS_R2,
+                                          IS_R2_forOOS=IS_R2_forOOS,
+                                          IS_MSEF=IS_MSEF,
+                                          IS_aMSPE=IS_aMSPE,
+                                          t_statisitcs_IS=t_statisitcs_IS,
+                                          OOS_delta_RMSE_Alt1=OOS_delta_RMSE_Alt1,
+                                          OOS_delta_RMSE_Alt2=OOS_delta_RMSE_Alt2,
+                                          OOS_delta_RMSE_Alt3=OOS_delta_RMSE_Alt3,
+                                          OOS_R2_Alt1=OOS_R2_Alt1,
+                                          OOS_R2_Alt2=OOS_R2_Alt2,
+                                          OOS_R2_Alt3=OOS_R2_Alt3,
+                                          OOS_MSEF_Alt1=OOS_MSEF_Alt1,
+                                          OOS_MSEF_Alt2=OOS_MSEF_Alt2,
+                                          OOS_MSEF_Alt3=OOS_MSEF_Alt3,
+                                          OOS_aMSPE_Alt1=OOS_aMSPE_Alt1,
+                                          t_statisitcs_Alt1=t_statisitcs_Alt1,
+                                          OOS_aMSPE_Alt2=OOS_aMSPE_Alt2,
+                                          t_statisitcs_Alt2=t_statisitcs_Alt2,
+                                          OOS_aMSPE_Alt3=OOS_aMSPE_Alt3,
+                                          t_statisitcs_Alt3=t_statisitcs_Alt3)))
+  
+}
+```
+
+```{r}
+# Function "statistics" is the same as above function with 2 differences:
+  ## 1. returns only statistics MSEF (to be used in bootstrap)
+  ## 2. no tune model, use 15 hidden units
+
+statistics=function(data,forecast_start=20){
+
+############# Data preparation
+  if(!is.xts(data)) print("Data is not xts object") # make sure data is xts object
+  tmp=data;rm(data)# data is a xts object: y, x
+  tmp[,-1]=lag.xts(tmp[,-1],k=1) # lag regressor
+  tmp=tmp[complete.cases(tmp),] # remove NA, keep tmp b/c it includes time index to use later
+  tmp_x=as.matrix(tmp[,2]) # predictors data is a matrix, keep name of column
+  tmp_y=as.matrix(tmp[,1]) #  target is a matrix
+  
+############ 1. IS Regressions
+  
+  ##### 1.1. Null model: mean
+  IS_avg=mean(tmp[,1])
+  IS_error_Null=(tmp[,1]-IS_avg)^2
+  
+  ##### 1.2. Alternative model:
+  ### Function to define model
+  define_model=function(neurons=15){
+    k_clear_session()
+    nn_model =  keras_model_sequential()
+  
+    nn_model %>% layer_dense(units=neurons,
+                           activation = 'relu',
+                           input_shape =1) %>%
+                 layer_dropout(rate=0.8) %>%
+                 layer_dense(units=1)
+  
+    nn_model %>% compile (optimizer = optimizer_rmsprop(lr = 0.002),
+                        loss = 'mse')
+    return(nn_model)
+  }
+  ### Fit final model
+  k_clear_session()
+  IS_fit=define_model(neurons=15)
+  IS_fit %>% fit(tmp_x,tmp_y,
+               epochs = 80,
+               batch_size=128,
+               verbose = 1, 
+               shuffle=FALSE)
+  ### Predictions and Errors
+  IS_preds_vec=IS_fit %>% predict(tmp_x)
+  IS_error_Alt=(tmp_y-IS_preds_vec)^2
+  
+  rm(IS_fit)
+  gc(verbose = FALSE)
+  k_clear_session()
+  
+############# 2. OOS Regressions
+
+  OOS_period=NULL
+
+  ## 4 models:    
+  OOS_avgs_vec=NULL       
+  OOS_preds_vec=NULL      
+  OOS_preds_CT_vec=NULL   
+  OOS_preds_Alt2_vec=NULL 
+  OOS_preds_Alt3_vec=NULL
+  
+  OOS_error_Null=NULL 
+  OOS_error_Alt1=NULL  
+  OOS_error_Alt2=NULL 
+  OOS_error_Alt3=NULL 
+
+  if (forecast_start==20|forecast_start-lubridate::year(start(tmp))<19) {start_loop=start(tmp)+months(238)}
+  else {start_loop=as.Date.yearmon(forecast_start)-months(1)}
+  loop_index=seq.Date(from = start_loop,
+                      to=end(tmp)-months(1),
+                      by="month")
+  
+  for(i in loop_index){
+   
+    ########### Data preparation   
+      ### Training data
+    i=as.Date(i)
+    train_data=tmp[paste0("/",i)] 
+    train_x=as.matrix(train_data[,2]) # predictors data is a matrix, keep name
+    train_y=as.matrix(train_data[,1])#  target is a matrix
+      ### Forecast data
+    forecast_data=tmp[i+months(1)] 
+    forecast_x=as.matrix(forecast_data[,2]) # predictors data is a matrix
+    forecast_y=as.matrix(forecast_data[,1]) #  target is a matrix
+      ### OOS data 
+    OOS_period=c(OOS_period,i+months(1))
+    OOS_data=tmp[as.Date(OOS_period)] %>% as.data.frame() 
+    
+    ########## 2.1. Null model: 
+    OOS_avg=mean(train_y)
+    OOS_avgs_vec=c(OOS_avgs_vec,OOS_avg)
+    OOS_error_Null=c(OOS_error_Null,(forecast_y-OOS_avg)^2)
+    
+    ########## 2.2. Model Alternative 1: 
+    ### Fit final model
+    k_clear_session()
+    OOS_fit=define_model(neurons=15)
+    OOS_fit %>% fit(train_x,train_y,
+                    epochs = 80,
+                    batch_size=128,
+                    verbose = 1, 
+                    shuffle=FALSE)
+
+    ### Predictions and Errors
+    OOS_pred=OOS_fit %>% predict(forecast_x)
+    OOS_pred_CT=ifelse(OOS_pred>0,OOS_pred,0)
+    OOS_preds_vec=c(OOS_preds_vec,OOS_pred)
+    OOS_preds_CT_vec=c(OOS_preds_CT_vec,OOS_pred_CT)
+    OOS_error_Alt1=c(OOS_error_Alt1,(forecast_y-OOS_pred_CT)^2)
+    rm(OOS_fit)
+    gc(verbose = FALSE)
+    k_clear_session()
+    ######## 2.3. Model Alternative 2: 
+    OOS_delta=cov(OOS_data[,1]-OOS_avgs_vec,OOS_preds_vec-OOS_avgs_vec)/var(OOS_preds_vec-OOS_avgs_vec)
+    OOS_pred_Alt2=(1-OOS_delta)*OOS_avg+OOS_delta*OOS_pred
+    if (is.na(OOS_pred_Alt2)|OOS_pred_Alt2<0) {
+      OOS_pred_Alt2=0
+    }
+    OOS_error_Alt2=c(OOS_error_Alt2,(forecast_y-OOS_pred_Alt2)^2)
+    
+    ########## 2.4. Model Alternative 3: 
+
+    OOS_delta_CT=cov(OOS_data[,1]-OOS_avgs_vec,OOS_preds_CT_vec-OOS_avgs_vec)/var(OOS_preds_CT_vec-OOS_avgs_vec)
+    OOS_pred_Alt3=(1-OOS_delta_CT)*OOS_avg+OOS_delta_CT*OOS_pred_CT
+    if (is.na(OOS_pred_Alt3)|OOS_pred_Alt3<0) {
+      OOS_pred_Alt3=0
+    }
+    OOS_error_Alt3=c(OOS_error_Alt3,(forecast_y-OOS_pred_Alt3)^2)
+    }
+  
+############### Computing statistics
+
+    ### Length of IS period and OOS period
+  t_IS=length(IS_error_Null)   # full sample
+  t_OOS=length(OOS_error_Null) # OOS period
+
+    ### IS MSE-F statistic
+  IS_MSE_Null=mean(IS_error_Null)
+  IS_MSE_Alt=mean(IS_error_Alt)
+  IS_MSEF=t_IS*(IS_MSE_Null-IS_MSE_Alt)/IS_MSE_Alt
+    ### OOS MSE-F statistics
+  OOS_MSE_Null=mean(OOS_error_Null)
+  OOS_MSE_Alt1=mean(OOS_error_Alt1)
+  OOS_MSE_Alt2=mean(OOS_error_Alt2)
+  OOS_MSE_Alt3=mean(OOS_error_Alt3)
+  OOS_MSEF_Alt1=t_OOS*(OOS_MSE_Null-OOS_MSE_Alt1)/OOS_MSE_Alt1
+  OOS_MSEF_Alt2=t_OOS*(OOS_MSE_Null-OOS_MSE_Alt2)/OOS_MSE_Alt2
+  OOS_MSEF_Alt3=t_OOS*(OOS_MSE_Null-OOS_MSE_Alt3)/OOS_MSE_Alt3
+  return(data.frame(IS_MSEF=IS_MSEF,
+                    OOS_MSEF_Alt1=OOS_MSEF_Alt1,
+                    OOS_MSEF_Alt2=OOS_MSEF_Alt2,
+                    OOS_MSEF_Alt3=OOS_MSEF_Alt3))
+  
+}
+```
+
+
+```{r}
+my.quant = function(x,p){
+  n = length(x)
+  x.sort = sort(x)
+  n.p = p*n
+  if(n.p == floor(n.p)){
+    q.p = 0.5*(x.sort[n.p]+x.sort[n.p+1])
+  }else{
+    q.p = x.sort[ceiling(n.p)]
+  }
+  return(q.p)
+}
+```
+
+```{r}
+find_cv=function(data,feature,forecast_start=20,B=499){
+########### Data preparation
+  if(!is.xts(data)) print("Data is not xts object")
+  tmp=data[,c("logPremia",feature)];rm(data)
+  names(tmp)=c("y","x")
+  tmp=tmp[complete.cases(tmp),] # Remove NA, but keep all available data (not remove first row)
+  tmp$lagx=lag.xts(tmp[,-1],k=1) # add column lagx
+  tmp_data=as.data.frame(tmp[-1,]) # data frame having 3 columns: y(t+1), x(t+1), x(t), and remove first row
+  k=nrow(tmp)
+
+########### H0: y(t+1) = alpha + u1(t+1)
+  alpha=mean(tmp_data[,1])
+  u1=tmp_data[,1]-alpha
+  
+########### x(t+1) = mu + ro*x(t) + u2(t+1)    
+  x_fit=lm(x~lagx,data=tmp_data)
+  u2=resid(x_fit)
+  
+########## bootstrap
+  metric=foreach(icount(B), .combine='rbind') %do% {
+        u1.boot=sample(u1,size = nrow(tmp_data),replace = TRUE)
+        u2.boot=sample(u2,size = nrow(tmp_data),replace = TRUE)
+        y.boot=alpha+u1.boot
+        x.boot=predict(x_fit,tmp_data)+u2.boot
+        data.boot=data.frame(y=y.boot,x=x.boot)
+        data.boot=rbind(coredata(tmp[sample(1:k,1),1:2]),data.boot) 
+        data.boot=xts(data.boot,order.by = time(tmp))# xts object: y, x 
+        a=statistics(data.boot,forecast_start=forecast_start) 
+        return(a)
+  }
+
+########## Compute critical values
+  cv_0.9=apply(metric,2,my.quant,p=0.9)
+  cv_0.95=apply(metric,2,my.quant,p=0.95)
+  cv_0.99=apply(metric,2,my.quant,p=0.99)
+  critical_value=cbind(cv_0.9,cv_0.95,cv_0.99) %>% as.data.frame()
+  
+  ### Add column feature
+  all_features=c("b.m","logDY","logEP","ntis","tbl")
+  critical_value$feature=which(all_features==feature)
+  return(critical_value=critical_value)
+}
+```
+
+```{r}
+plot_figure=function(SSE,main=NULL,ylim=NULL){
+  SSE=SSE[complete.cases(SSE),-c(4,5)]#
+  SSE$IS=SSE$IS-as.numeric(SSE$IS[1])
+  plot.zoo(SSE,plot.type = "single",col=c("black","blue","red"),lty=1:3,ylim=ylim,main=main)
+  abline(h=0,lty=3,col="darkblue")
+  rect(xleft=as.Date("1973-11-01"),
+     xright=as.Date("1975-03-01"),
+     ybottom=-10, ytop=10, col= adjustcolor( "red", alpha.f = 0.2),border=NA)
+  rect(xleft=as.Date("1980-01-01"),
+    xright=as.Date("1981-06-01"),
+    ybottom=-10, ytop=10, col= adjustcolor( "red", alpha.f = 0.2),border=NA) 
+  rect(xleft=as.Date("1981-06-01"),
+    xright=as.Date("1982-11-01"),
+    ybottom=-10, ytop=10, col= adjustcolor( "red", alpha.f = 0.2),border=NA) 
+  rect(xleft=as.Date("1990-06-01"),
+    xright=as.Date("1991-03-01"),
+    ybottom=-10, ytop=10, col= adjustcolor( "red", alpha.f = 0.2),border=NA) 
+  rect(xleft=as.Date("2001-10-01"),#2002-01-01
+     xright=as.Date("2003-03-01"),#2003-01-01
+     ybottom=-10, ytop=10, col= adjustcolor( "red", alpha.f = 0.2),border=NA) 
+  rect(xleft=as.Date("2007-12-01"),#2008-05-01
+     xright=as.Date("2009-07-01"),#2009-08-01
+     ybottom=-10, ytop=10, col= adjustcolor( "red", alpha.f = 0.2),border=NA) 
+  #legend("bottomleft",legend = c("IS","OOS_Alt1","OOS_Alt2","OOS_Alt3"),col=c("black","green","blue","red"),lty=1:4)
+}
+```
+
+```{r}
+## Make sure Output foler exist in working direction, if not, create one
+if (!dir.exists(nnDir)) {
+  cat(paste0("neuralnetwork Output folder does not exist. Please check the working direction"))
+} else {
+  comb <- function(x, ...) {
+    lapply(seq_along(x),
+    function(i) do.call(rbind,c(x[[i]], lapply(list(...), function(y) y[[i]]))))
+  } 
+  all_features=c("b.m","logDY","logEP","ntis","tbl")
+  all_tables=foreach(i=all_features,.combine='comb',.multicombine=TRUE,.init=list(list(),list(), list(),list())) %do% {
+      ### Compute all statistics
+    a=neuralnetwork(dat,feature=i,forecast_start=1965)
+      ### Diagnostic plot
+    png(filename = paste0(nnDir,"/ver_neuralnetwork_",i,".png"))
+    plot_figure(a[[1]],ylim=NULL,main = i)
+    dev.off()
+      ### Compute critical values
+    critical_value=find_cv(dat,feature=i,forecast_start=1965,B=999)
+
+    return(list(all_statistics=a[[3]],
+               critical_value=critical_value,
+               SSE=a[[1]],
+               predictions=a[[2]]))
+  }
+}
+```
+
+```{r}
+write.csv(all_tables[[1]],paste0(nnDir,"/neuralnetwork_all_statistics.csv"),row.names = FALSE)
+write.csv(all_tables[[2]],paste0(nnDir,"/neuralnetwork_critical_value.csv"))
+write.zoo(all_tables[[3]],sep=",",paste0(nnDir,"/neuralnetwork_SSE.csv"))
+write.zoo(all_tables[[4]],sep=",",paste0(nnDir,"/neuralnetwork_predictions.csv"))
+```
+
